@@ -1,136 +1,135 @@
 "use client";
-import { getCreateAccountInstruction } from "@solana-program/system";
+
+import { useState } from "react";
+import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import {
-    findAssociatedTokenPda,
-    getCreateAssociatedTokenInstructionAsync,
-    getInitializeMintInstruction,
-    getMintSize,
-    getMintToCheckedInstruction,
-    TOKEN_2022_PROGRAM_ADDRESS,
-} from "@solana-program/token-2022";
+    Keypair,
+    PublicKey,
+    Transaction,
+    SystemProgram,
+    sendAndConfirmTransaction,
+} from "@solana/web3.js";
 import {
-    airdropFactory,
-    appendTransactionMessageInstructions,
-    createSolanaRpc,
-    createSolanaRpcSubscriptions,
-    createTransactionMessage,
-    generateKeyPairSigner,
-    getSignatureFromTransaction,
-    lamports,
-    pipe,
-    sendAndConfirmTransactionFactory,
-    setTransactionMessageFeePayerSigner,
-    setTransactionMessageLifetimeUsingBlockhash,
-    signTransactionMessageWithSigners,
-} from "@solana/kit";
+    createMint,
+    getAssociatedTokenAddress,
+    createAssociatedTokenAccountInstruction,
+    mintTo,
+    TOKEN_PROGRAM_ID,
+    createMintToInstruction,
+} from "@solana/spl-token";
+import { WalletNotConnectedError } from "@solana/wallet-adapter-base";
 
-const rpc = createSolanaRpc("http://localhost:8899");
-const rpcSubscriptions = createSolanaRpcSubscriptions("ws://localhost:8900");
+export default function MintingForm() {
+    const { connection } = useConnection();
+    const { publicKey, sendTransaction, signTransaction } = useWallet();
+    const [decimals, setDecimals] = useState(9);
+    const [mintAmount, setMintAmount] = useState(1000);
+    const [isLoading, setIsLoading] = useState(false);
+    const [signature, setSignature] = useState("");
+    const [error, setError] = useState("");
 
-/* constants */
-const MINT_AUTHORITY = await generateKeyPairSigner();
-const DECIMALS = 9;
-const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
+    const handleMint = async () => {
+        if (!publicKey || !signTransaction) {
+            setError("Wallet not connected");
+            throw new WalletNotConnectedError();
+        }
 
-let { mint, associatedTokenAddress } = await setup();
+        setIsLoading(true);
+        setError("");
+        setSignature("");
+        try {
+            const mintKeypair = Keypair.generate();
 
-const mintToIx = await getMintToCheckedInstruction({
-    mint,
-    token: associatedTokenAddress,
-    mintAuthority: MINT_AUTHORITY,
-    amount: 1_000_000_000n, // 1
-    decimals: DECIMALS,
-});
+            const mint = await createMint(
+                connection,
+                mintKeypair,
+                publicKey,
+                null,
+                decimals,
+                mintKeypair,
+            );
 
-const transactionMessage = pipe(
-    createTransactionMessage({ version: 0 }),
-    (tx) => setTransactionMessageFeePayerSigner(MINT_AUTHORITY, tx),
-    (tx) => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, tx),
-    (tx) => appendTransactionMessageInstructions([mintToIx], tx),
-);
+            const ata = await getAssociatedTokenAddress(mint, publicKey);
 
-const signedTransaction =
-    await signTransactionMessageWithSigners(transactionMessage);
+            const ataIx = createAssociatedTokenAccountInstruction(
+                publicKey,
+                ata,
+                publicKey,
+                mint,
+            );
 
-await sendAndConfirmTransactionFactory({ rpc, rpcSubscriptions })(
-    signedTransaction,
-    { commitment: "confirmed" },
-);
+            const mintIx = createMintToInstruction(
+                mint,
+                ata,
+                publicKey,
+                BigInt(mintAmount) * BigInt(10 ** decimals),
+            );
 
-const txSignature = getSignatureFromTransaction(signedTransaction);
-console.log("Transaction Signature: ", txSignature);
+            const tx = new Transaction().add(ataIx).add(mintIx);
 
-/*
- * The setup function initializes the mint and token accounts
- *
- */
-async function setup() {
-    await airdropFactory({ rpc, rpcSubscriptions })({
-        recipientAddress: MINT_AUTHORITY.address,
-        lamports: lamports(1_000_000_000n), // 1 SOL
-        commitment: "confirmed",
-    });
+            const sig = await sendTransaction(tx, connection);
 
-    const mint = await generateKeyPairSigner();
+            await connection.confirmTransaction(sig, "confirmed");
 
-    const space = BigInt(getMintSize());
-
-    const rent = await rpc.getMinimumBalanceForRentExemption(space).send();
-
-    // create & initialize mint account
-    const createAccountInstruction = getCreateAccountInstruction({
-        payer: MINT_AUTHORITY,
-        newAccount: mint,
-        lamports: rent,
-        space,
-        programAddress: TOKEN_2022_PROGRAM_ADDRESS,
-    });
-
-    const initializeMintInstruction = getInitializeMintInstruction({
-        mint: mint.address,
-        decimals: DECIMALS,
-        mintAuthority: MINT_AUTHORITY.address,
-    });
-
-    // create token account
-    const [associatedTokenAddress] = await findAssociatedTokenPda({
-        mint: mint.address,
-        owner: MINT_AUTHORITY.address,
-        tokenProgram: TOKEN_2022_PROGRAM_ADDRESS,
-    });
-
-    const createAtaInstruction = await getCreateAssociatedTokenInstructionAsync(
-        {
-            payer: MINT_AUTHORITY,
-            mint: mint.address,
-            owner: MINT_AUTHORITY.address,
-        },
-    );
-
-    const instructions = [
-        createAccountInstruction,
-        initializeMintInstruction,
-        createAtaInstruction,
-    ];
-
-    const transactionMessage = pipe(
-        createTransactionMessage({ version: 0 }),
-        (tx) => setTransactionMessageFeePayerSigner(MINT_AUTHORITY, tx),
-        (tx) =>
-            setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, tx),
-        (tx) => appendTransactionMessageInstructions(instructions, tx),
-    );
-
-    const signedTransaction =
-        await signTransactionMessageWithSigners(transactionMessage);
-
-    await sendAndConfirmTransactionFactory({ rpc, rpcSubscriptions })(
-        signedTransaction,
-        { commitment: "confirmed" },
-    );
-
-    return {
-        mint: mint.address,
-        associatedTokenAddress,
+            setSignature(sig);
+        } catch (err: any) {
+            setError(err.message || "Mint failed");
+        } finally {
+            setIsLoading(false);
+        }
     };
+
+    return (
+        <div className="p-4 border rounded-lg max-w-md mx-auto">
+            <h2 className="text-2xl font-bold mb-4 text-center">
+                Create a Token
+            </h2>
+            <div className="flex flex-col gap-4">
+                <input
+                    type="number"
+                    value={decimals}
+                    onChange={(e) => setDecimals(parseInt(e.target.value))}
+                    placeholder="Decimals"
+                    className="input input-bordered w-full"
+                />
+                <input
+                    type="number"
+                    value={mintAmount}
+                    onChange={(e) => setMintAmount(parseInt(e.target.value))}
+                    placeholder="Amount"
+                    className="input input-bordered w-full"
+                />
+                <button
+                    className="btn btn-primary w-full"
+                    onClick={handleMint}
+                    disabled={isLoading || !publicKey}
+                >
+                    {isLoading
+                        ? "Minting..."
+                        : !publicKey
+                          ? "Connect Wallet to Mint"
+                          : "Mint Token"}
+                </button>
+
+                {signature && (
+                    <div className="alert alert-success">
+                        <a
+                            href={`https://explorer.solana.com/tx/${signature}?cluster=devnet`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="link"
+                        >
+                            {signature}
+                        </a>
+                    </div>
+                )}
+
+                {error && (
+                    <div className="alert alert-error">
+                        <p>{error}</p>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
 }
